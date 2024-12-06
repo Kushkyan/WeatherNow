@@ -1,0 +1,293 @@
+import requests
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+import logging
+import re
+
+# Настроим логирование
+logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger()
+
+# Ваши ключи API
+OPENWEATHER_API_KEY = 'b03fe07dd50b94b37d91876507a1e844'  # Замените на ваш ключ
+TELEGRAM_API_KEY = '7857736836:AAG4gEIsgOhG_0moVfOxT7j_4Df38DIpcBY'  # Замените на ваш ключ
+
+# Функции для работы с погодой и форматирования
+def get_weather_emoji(description):
+    """Возвращает эмодзи в зависимости от описания погоды."""
+    if "ясно" in description or "чистое" in description:
+        return "☀️"
+    elif "облачно" in description or "переменная облачность" in description:
+        return "🌤"
+    elif "дождь" in description:
+        return "🌧"
+    elif "снег" in description:
+        return "❄️"
+    elif "туман" in description or "дымка" in description:
+        return "🌫"
+    else:
+        return "🌤"
+
+def month_to_name(month, case='nom'):
+    """Возвращает имя месяца в нужном падеже."""
+    month_names = {
+        'nom': ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"],
+        'gen': ["Января", "Февраля", "Марта", "Апреля", "Мая", "Июня", "Июля", "Августа", "Сентября", "Октября", "Ноября", "Декабря"]
+    }
+    return month_names[case][month - 1]
+
+# Пример использования:
+today_date = datetime.now()
+date_formatted = f"{today_date.day} {month_to_name(today_date.month, 'gen')}"
+
+
+def get_weather_data(latitude, longitude):
+    """Получение данных о текущей погоде и прогнозе с OpenWeatherMap API."""
+    url_current = f'http://api.openweathermap.org/data/2.5/weather?lat={latitude}&lon={longitude}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru'
+    url_forecast = f'http://api.openweathermap.org/data/2.5/forecast?lat={latitude}&lon={longitude}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru'
+
+    current_response = requests.get(url_current).json()
+    forecast_response = requests.get(url_forecast).json()
+
+    return current_response, forecast_response
+
+def get_day_suffix(days):
+    """Возвращает правильную строку для описания дня прогноза."""
+    if days == 0:
+        return "Сегодня"
+    elif days == 1:
+        return "Завтра"
+    elif days in [2, 3, 4]:
+        return f"через {days} дня"
+    else:
+        return f"через {days} дней"
+
+import re
+
+def dms_to_decimal(degrees, minutes, seconds, direction):
+    """Преобразует координаты из DMS (градусы, минуты, секунды) в десятичный формат."""
+    decimal = degrees + minutes / 60 + seconds / 3600
+    if direction in ['S', 'W']:
+        decimal *= -1
+    return decimal
+
+def parse_coordinates(text):
+    """Парсит текст для извлечения координат в форматах DD.DDDD и DMS."""
+    pattern_decimal = r"(-?\d+\.\d+),\s*(-?\d+\.\d+)"
+    pattern_dms = r"(\d+)°(\d+)'(\d+\.\d+)[\"′″]\s*([NSEW]),\s*(\d+)°(\d+)'(\d+\.\d+)[\"′″]\s*([NSEW])"
+
+    match_decimal = re.match(pattern_decimal, text)
+    match_dms = re.match(pattern_dms, text)
+
+    if match_decimal:
+        latitude = float(match_decimal.group(1))
+        longitude = float(match_decimal.group(2))
+        return latitude, longitude
+    elif match_dms:
+        lat_deg = int(match_dms.group(1))
+        lat_min = int(match_dms.group(2))
+        lat_sec = float(match_dms.group(3))
+        lat_dir = match_dms.group(4)
+
+        lon_deg = int(match_dms.group(5))
+        lon_min = int(match_dms.group(6))
+        lon_sec = float(match_dms.group(7))
+        lon_dir = match_dms.group(8)
+
+        latitude = dms_to_decimal(lat_deg, lat_min, lat_sec, lat_dir)
+        longitude = dms_to_decimal(lon_deg, lon_min, lon_sec, lon_dir)
+        return latitude, longitude
+
+    return None
+
+
+def get_temperature_emoji(feels_like):
+    """Возвращает эмодзи в зависимости от ощущения температуры."""
+    if feels_like >= 30:
+        return "🥵"  # Очень тепло (30°C и выше)
+    elif feels_like >= 20:
+        return "🌞"  # Тепло (от 20°C до 29°C)
+    elif feels_like >= 10:
+        return "🤗"  # Умеренно (от 10°C до 19°C)
+    else:
+        return "🥶"  # Холодно (ниже 10°C)
+def day_of_week_in_russian(day_of_week):
+    """Возвращает название дня недели на русском языке."""
+    days = {
+        "Monday": "Понедельник",
+        "Tuesday": "Вторник",
+        "Wednesday": "Среда",
+        "Thursday": "Четверг",
+        "Friday": "Пятница",
+        "Saturday": "Суббота",
+        "Sunday": "Воскресенье"
+    }
+    return days[day_of_week]
+
+def create_current_weather_message(current_data):
+    """Создает сообщение о текущей погоде."""
+    description = current_data["weather"][0]["description"].capitalize()
+    weather_emoji = get_weather_emoji(description)
+    temperature = int(current_data["main"]["temp"])
+    wind_speed = round(current_data["wind"]["speed"], 1)
+    humidity = current_data["main"]["humidity"]
+    pressure = current_data["main"]["pressure"]
+    rain = round(current_data.get("rain", {}).get("1h", 0), 1)
+    rain = f"{rain:.1f}"
+
+    feels_like = int(current_data["main"]["feels_like"])
+    temperature_emoji = get_temperature_emoji(feels_like)
+
+    today_date = datetime.now()
+    date_formatted = f"{today_date.day} {month_to_name(today_date.month, 'gen')}"
+    current_time = today_date.strftime("%H:%M")
+    day_of_week = day_of_week_in_russian(today_date.strftime('%A'))
+
+    sunrise = datetime.fromtimestamp(current_data["sys"]["sunrise"]).strftime("%H:%M")
+    sunset = datetime.fromtimestamp(current_data["sys"]["sunset"]).strftime("%H:%M")
+
+    current_weather_message = (
+        f"🟢 Сейчас: {current_time}, {date_formatted}, {day_of_week}\n\n"
+        f"{weather_emoji} {description}\n"
+        f"🌡 Температура:    {temperature}°C\n"
+        f"{temperature_emoji} Ощущается:       {feels_like}°C\n"
+        f"💨 Ветер:                 {wind_speed:.1f} м/с\n"
+        f"💧 Влажность:        {humidity}%\n"
+        f"🗜 Давление:          {pressure} гПа\n"
+        f"🌧 Осадки:               {rain} мм\n"
+        f"🌅 Восход:               {sunrise}\n"
+        f"🌄 Закат:                  {sunset}\n"
+    )
+    return current_weather_message
+
+def create_forecast_message(forecast_data):
+    """Создает сообщение о прогнозе погоды."""
+    forecast_lines = []
+    current_date = datetime.now().date()
+
+    daily_forecast = {}
+
+    for item in forecast_data["list"]:
+        dt = datetime.strptime(item["dt_txt"], "%Y-%m-%d %H:%M:%S")
+        date = dt.date()
+        if date >= current_date:  # Убедимся, что прогноз начинается с сегодняшнего дня
+            if date not in daily_forecast:
+                daily_forecast[date] = {
+                    "temp_min": int(item["main"]["temp_min"]),
+                    "temp_max": int(item["main"]["temp_max"]),
+                    "wind_speed": round(item["wind"]["speed"], 1),
+                    "rain": round(item.get("rain", {}).get("3h", 0), 1)
+                }
+            else:
+                daily_forecast[date]["temp_min"] = min(daily_forecast[date]["temp_min"], int(item["main"]["temp_min"]))
+                daily_forecast[date]["temp_max"] = max(daily_forecast[date]["temp_max"], int(item["main"]["temp_max"]))
+                daily_forecast[date]["wind_speed"] = max(daily_forecast[date]["wind_speed"], round(item["wind"]["speed"], 1))
+                daily_forecast[date]["rain"] += round(item.get("rain", {}).get("3h", 0), 1)
+
+    for date, forecast in daily_forecast.items():
+        day = date.day
+        month_name = month_to_name(date.month, 'gen')
+        description = forecast_data["list"][0]["weather"][0]["description"].capitalize()
+        emoji = get_weather_emoji(description)
+        temp_min = forecast["temp_min"]
+        temp_max = forecast["temp_max"]
+        wind_speed = forecast["wind_speed"]
+        rain = f"{forecast['rain']:.1f}"  # Преобразуем значение осадков в строку с 1 знаком после запятой
+        rain_status = f"{rain} мм"
+
+        days_ahead = (date - current_date).days
+        suffix = get_day_suffix(days_ahead)
+        day_of_week = day_of_week_in_russian(date.strftime('%A'))
+
+        forecast_lines.append(
+            f"{suffix} {emoji} {temp_max}° {temp_min}°\n"
+            f"{day} {month_name}, {day_of_week}\n"
+            f"Ветер: {wind_speed:.1f} м/с, Осадки: {rain_status}"
+        )
+
+    forecast_message = "🟠 Прогноз погоды на пять дней:\n\n" + "\n\n".join(forecast_lines)
+    return forecast_message
+
+
+async def start(update: Update, context: CallbackContext):
+    """Отправка приветственного сообщения."""
+    logger.info("Бот получил команду /start")
+    await update.message.reply_text(
+    "👋 Отправь мне локацию! (→📎→ геопозиция)\n 🗺️ Или координаты в любом формате, примеры: \n 👉 40.792574, 43.846909 или 40°47'33.3\"N, 43°50'48.9\"E\n 📍Вы можете выбрать любую точку нашей планеты!"
+)
+
+def parse_coordinates(text):
+    """Парсит текст для извлечения координат в форматах DD.DDDD и DMS."""
+    pattern_decimal = r"(-?\d+\.?\d*)\s*(-?\d+\.?\d*)"
+    pattern_dms = r"(\d+)°(\d+)'(\d+\.\d+)[\"′″]\s*([NSEW]),\s*(\d+)°(\d+)'(\д+\.\д+)[\"′″]\с*([NSEW])"
+
+    match_decimal = re.match(pattern_decimal, text)
+    match_dms = re.match(pattern_dms, text)
+
+    if match_decimal:
+        latitude = float(match_decimal.group(1))
+        longitude = float(match_decimal.group(2))
+        return latitude, longitude
+    elif match_dms:
+        lat_deg = int(match_dms.group(1))
+        lat_min = int(match_dms.group(2))
+        lat_sec = float(match_dms.group(3))
+        lat_dir = match_dms.group(4)
+
+        lon_deg = int(match_dms.group(5))
+        lon_min = int(match_dms.group(6))
+        lon_sec = float(match_dms.group(7))
+        lon_dir = match_dms.group(8)
+
+        latitude = dms_to_decimal(lat_deg, lat_min, lat_sec, lat_dir)
+        longitude = dms_to_decimal(lon_deg, lon_min, lon_sec, lon_dir)
+        return latitude, longitude
+
+    return None
+
+async def handle_message(update: Update, context: CallbackContext):
+    """Обработка сообщения пользователя с координатами."""
+    text = update.message.text
+    coordinates = parse_coordinates(text)
+    if coordinates:
+        latitude, longitude = coordinates
+        current_data, forecast_data = get_weather_data(latitude, longitude)
+
+        current_weather_message = create_current_weather_message(current_data)
+        forecast_message = create_forecast_message(forecast_data)
+        
+        await update.message.reply_text(current_weather_message)
+        await update.message.reply_text(forecast_message)
+    else:
+        await update.message.reply_text("🙏Пожалуйста, отправьте мне координаты (примеры 👉 40.792574, 43.846909 или 40°47'33.3\"N, 43°50'48.9\"E).")
+
+async def handle_location(update: Update, context: CallbackContext):
+    """Обработка локации пользователя."""
+    user_location = update.message.location
+    latitude = user_location.latitude
+    longitude = user_location.longitude
+
+    logger.info(f"Получены координаты: {latitude}, {longitude}")
+
+    current_data, forecast_data = get_weather_data(latitude, longitude)
+
+    current_weather_message = create_current_weather_message(current_data)
+    forecast_message = create_forecast_message(forecast_data)
+
+    await update.message.reply_text(current_weather_message)
+    await update.message.reply_text(forecast_message)
+
+def main():
+    """Запуск бота."""
+    application = Application.builder().token(TELEGRAM_API_KEY).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.LOCATION, handle_location))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Бот запускается...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
